@@ -1,0 +1,18 @@
+# Build output
+target/
+bin/
+obj/
+
+# Visual Studio and Rider
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Windows and editor noise
+Thumbs.db
+Desktop.ini
+*.swp
+*.tmp

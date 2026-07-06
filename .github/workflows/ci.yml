@@ -1,0 +1,31 @@
+name: Rust Desktop
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows desktop app
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Check
+        run: cargo check --locked
+
+      - name: Build
+        run: cargo build --release --locked
