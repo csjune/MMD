@@ -2,7 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
@@ -12,21 +12,24 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use windows::Win32::Devices::Display::{
-    DestroyPhysicalMonitor, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
-    GetPhysicalMonitorsFromHMONITOR, PHYSICAL_MONITOR, SetMonitorBrightness,
+    DestroyPhysicalMonitor, GetMonitorBrightness, GetMonitorCapabilities,
+    GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR, MC_CAPS_BRIGHTNESS,
+    PHYSICAL_MONITOR, SetMonitorBrightness,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    CreateMutexW, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::Accessibility::{
-    HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent,
-};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -35,30 +38,34 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, GWLP_USERDATA,
-    GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetMessageW, GetShellWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HMENU,
-    HICON, IDI_APPLICATION, IMAGE_ICON, IsIconic, IsWindowVisible, KillTimer, LR_DEFAULTSIZE,
-    LoadIconW, LoadImageW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NCCREATE,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_DESKTOPSWITCH,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    AppendMenuW, CHILDID_SELF, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
+    GetClassNameW, GetCursorPos, GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, IDI_APPLICATION,
+    IMAGE_ICON, IsIconic, IsWindowVisible, KillTimer, LR_DEFAULTSIZE, LoadIconW, LoadImageW,
+    MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
+    OBJID_WINDOW, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SW_HIDE, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NCCREATE, WM_NULL,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{w, BOOL, Error, PCWSTR, PWSTR};
+use windows::core::{BOOL, Error, PCWSTR, PWSTR, w};
 
 const APP_NAME: &str = "MMD";
 const CLASS_NAME: PCWSTR = w!("MmdRustWindow");
+const SINGLE_INSTANCE_MUTEX_NAME: PCWSTR = w!("Local\\MMD.SingleInstance.v1");
 const APP_ICON_RESOURCE_ID: PCWSTR = PCWSTR(1u16 as _);
 const WM_TRAYICON: u32 = WM_APP + 1;
 const WM_WINDOW_EVENT: u32 = WM_APP + 2;
 const TIMER_DEBOUNCE: usize = 1;
 const TRAY_UID: u32 = 1;
 const WS_EX_TOOLWINDOW: isize = 0x00000080;
+const MAX_TARGET_FAILURES: u8 = 3;
 
 const ID_BRIGHTNESS_0: usize = 1000;
 const ID_BRIGHTNESS_10: usize = 1010;
@@ -74,10 +81,20 @@ const ID_EXIT: usize = 2002;
 static EVENT_TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static EVENT_COUNT: AtomicI64 = AtomicI64::new(0);
 static LAST_EVENT: OnceLock<Mutex<Option<LastEvent>>> = OnceLock::new();
+static TASKBAR_CREATED_MESSAGE: OnceLock<u32> = OnceLock::new();
 
 fn main() -> windows::core::Result<()> {
+    let Some(_single_instance) = SingleInstanceGuard::acquire()? else {
+        return Ok(());
+    };
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    let taskbar_created_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if taskbar_created_message != 0 {
+        let _ = TASKBAR_CREATED_MESSAGE.set(taskbar_created_message);
     }
 
     let module = unsafe { GetModuleHandleW(None)? };
@@ -104,6 +121,32 @@ fn main() -> windows::core::Result<()> {
     }
 
     result
+}
+
+struct SingleInstanceGuard {
+    handle: HANDLE,
+}
+
+impl SingleInstanceGuard {
+    fn acquire() -> windows::core::Result<Option<Self>> {
+        unsafe {
+            let handle = CreateMutexW(None, false, SINGLE_INSTANCE_MUTEX_NAME)?;
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let _ = CloseHandle(handle);
+                Ok(None)
+            } else {
+                Ok(Some(Self { handle }))
+            }
+        }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
 }
 
 fn create_message_window(hinstance: HINSTANCE) -> windows::core::Result<HWND> {
@@ -181,22 +224,40 @@ unsafe extern "system" fn window_proc(
     }
 
     let state = &*state_ptr;
+    if TASKBAR_CREATED_MESSAGE
+        .get()
+        .is_some_and(|taskbar_created| message == *taskbar_created)
+    {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            state.restore_tray_icon();
+        }
+        return LRESULT(0);
+    }
+
     match message {
         WM_TRAYICON => {
             let tray_event = low_word(lparam.0);
-            if let Ok(mut state) = state.try_borrow_mut() {
-                match tray_event {
-                    WM_LBUTTONUP => state.toggle_tray_brightness(),
-                    WM_RBUTTONUP | WM_CONTEXTMENU => state.show_context_menu(),
-                    _ => {}
+            match tray_event {
+                WM_LBUTTONUP => {
+                    if let Ok(mut state) = state.try_borrow_mut() {
+                        state.toggle_tray_brightness();
+                    }
                 }
+                WM_RBUTTONUP | WM_CONTEXTMENU => {
+                    let manual_dimming_enabled = state
+                        .try_borrow()
+                        .map(|state| state.monitor_manager.manual_dimming_enabled())
+                        .unwrap_or(false);
+                    if let Some(command_id) = show_context_menu(hwnd, manual_dimming_enabled) {
+                        dispatch_command(hwnd, state, command_id);
+                    }
+                }
+                _ => {}
             }
             LRESULT(0)
         }
         WM_COMMAND => {
-            if let Ok(mut state) = state.try_borrow_mut() {
-                state.handle_command(wparam.0 & 0xffff);
-            }
+            dispatch_command(hwnd, state, wparam.0 & 0xffff);
             LRESULT(0)
         }
         WM_WINDOW_EVENT => {
@@ -206,15 +267,32 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TIMER => {
-            if wparam.0 == TIMER_DEBOUNCE {
-                if let Ok(mut state) = state.try_borrow_mut() {
-                    state.update_scheduled = false;
-                    unsafe {
-                        let _ = KillTimer(Some(hwnd), TIMER_DEBOUNCE);
-                    }
-                    state.update_brightness_state();
+            if wparam.0 == TIMER_DEBOUNCE
+                && let Ok(mut state) = state.try_borrow_mut()
+            {
+                state.update_scheduled = false;
+                state.retry_timer_scheduled = false;
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_DEBOUNCE);
                 }
+                state.update_brightness_state();
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.schedule_display_refresh();
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize => {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.schedule_display_refresh();
+            }
+            LRESULT(1)
+        }
+        WM_CLOSE => {
+            PostQuitMessage(0);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -225,6 +303,27 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+enum AppAction {
+    None,
+    Exit,
+    ShowDiagnostics(String),
+}
+
+fn dispatch_command(hwnd: HWND, state: &RefCell<AppState>, command_id: usize) {
+    let action = state
+        .try_borrow_mut()
+        .map(|mut state| state.handle_command(command_id))
+        .unwrap_or(AppAction::None);
+
+    match action {
+        AppAction::None => {}
+        AppAction::Exit => unsafe {
+            PostQuitMessage(0);
+        },
+        AppAction::ShowDiagnostics(text) => show_diagnostics(hwnd, &text),
+    }
+}
+
 #[derive(Clone)]
 struct AppSettings {
     empty_brightness: u32,
@@ -232,6 +331,7 @@ struct AppSettings {
     minimum_overlap_width: i32,
     minimum_overlap_height: i32,
     event_debounce_milliseconds: u32,
+    brightness_retry_milliseconds: u32,
     include_tool_windows: bool,
     excluded_process_names: HashSet<String>,
     excluded_class_names: HashSet<String>,
@@ -245,6 +345,7 @@ impl Default for AppSettings {
             minimum_overlap_width: 32,
             minimum_overlap_height: 32,
             event_debounce_milliseconds: 1000,
+            brightness_retry_milliseconds: 5000,
             include_tool_windows: false,
             excluded_process_names: [
                 "LockApp",
@@ -280,6 +381,8 @@ struct AppState {
     event_watcher: WinEventWatcher,
     tray_icon: TrayIcon,
     update_scheduled: bool,
+    retry_timer_scheduled: bool,
+    display_refresh_needed: bool,
     last_error: Option<String>,
 }
 
@@ -298,6 +401,8 @@ impl AppState {
             event_watcher,
             tray_icon,
             update_scheduled: false,
+            retry_timer_scheduled: false,
+            display_refresh_needed: false,
             last_error: None,
         };
 
@@ -305,7 +410,7 @@ impl AppState {
         Ok(state)
     }
 
-    fn handle_command(&mut self, command_id: usize) {
+    fn handle_command(&mut self, command_id: usize) -> AppAction {
         match command_id {
             ID_BRIGHTNESS_0 => self.set_brightness_now(0),
             ID_BRIGHTNESS_10 => self.set_brightness_now(10),
@@ -315,18 +420,18 @@ impl AppState {
             ID_BRIGHTNESS_100 => self.set_brightness_now(100),
             ID_TOGGLE_DIMMING => self.toggle_tray_brightness(),
             ID_REFRESH => self.refresh_now(),
-            ID_DIAGNOSTICS => self.show_diagnostics(),
-            ID_EXIT => unsafe {
-                let _ = DestroyWindow(self.hwnd);
-            },
+            ID_DIAGNOSTICS => return AppAction::ShowDiagnostics(self.build_diagnostics()),
+            ID_EXIT => return AppAction::Exit,
             _ => {}
         }
+
+        AppAction::None
     }
 
     fn toggle_tray_brightness(&mut self) {
         self.cancel_scheduled_update();
 
-        if self.monitor_manager.all_controllable_monitors_dimmed() {
+        if self.monitor_manager.manual_dimming_enabled() {
             let windows = self.window_tracker.get_tracked_windows();
             self.monitor_manager.restore_all_from_user(&windows);
         } else {
@@ -334,33 +439,59 @@ impl AppState {
         }
 
         self.update_tray_text();
+        self.schedule_pending_retry();
     }
 
     fn set_brightness_now(&mut self, brightness: u32) {
         let windows = self.window_tracker.get_tracked_windows();
-        self.monitor_manager.set_all_brightness(brightness, &windows);
+        self.monitor_manager
+            .set_all_brightness(brightness, &windows);
         self.update_tray_text();
+        self.schedule_pending_retry();
     }
 
     fn schedule_update(&mut self) {
-        if self.update_scheduled {
+        if self.update_scheduled && !self.retry_timer_scheduled {
             return;
         }
 
+        self.set_update_timer(self.settings.event_debounce_milliseconds, false);
+    }
+
+    fn set_update_timer(&mut self, delay_milliseconds: u32, is_retry: bool) {
         self.update_scheduled = true;
+        self.retry_timer_scheduled = is_retry;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_DEBOUNCE);
-            SetTimer(
+            let timer_id = SetTimer(
                 Some(self.hwnd),
                 TIMER_DEBOUNCE,
-                self.settings.event_debounce_milliseconds.max(1),
+                delay_milliseconds.max(1),
                 None,
             );
+            if timer_id == 0 {
+                self.update_scheduled = false;
+                self.retry_timer_scheduled = false;
+                self.last_error = Some("Failed to schedule brightness update".to_string());
+                self.update_tray_text();
+            }
         }
+    }
+
+    fn schedule_pending_retry(&mut self) {
+        if self.monitor_manager.pending_operation_count() > 0 && !self.update_scheduled {
+            self.set_update_timer(self.settings.brightness_retry_milliseconds, true);
+        }
+    }
+
+    fn schedule_display_refresh(&mut self) {
+        self.display_refresh_needed = true;
+        self.schedule_update();
     }
 
     fn cancel_scheduled_update(&mut self) {
         self.update_scheduled = false;
+        self.retry_timer_scheduled = false;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_DEBOUNCE);
         }
@@ -368,22 +499,33 @@ impl AppState {
 
     fn refresh_now(&mut self) {
         self.cancel_scheduled_update();
+        self.display_refresh_needed = true;
         self.update_brightness_state();
     }
 
     fn update_brightness_state(&mut self) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let windows = self.window_tracker.get_tracked_windows();
-            self.monitor_manager.update(&windows);
+            if std::mem::take(&mut self.display_refresh_needed) {
+                self.monitor_manager.reenumerate(&windows);
+            } else {
+                self.monitor_manager.update(&windows);
+            }
         }));
 
         self.last_error = result.err().map(|_| "Unexpected update error".to_string());
         self.update_tray_text();
+        self.schedule_pending_retry();
     }
 
     fn update_tray_text(&mut self) {
         let text = if let Some(error) = &self.last_error {
             format!("{APP_NAME} - Error: {error}")
+        } else if self.monitor_manager.pending_operation_count() > 0 {
+            format!(
+                "{APP_NAME} - retrying {} brightness update(s)",
+                self.monitor_manager.pending_operation_count()
+            )
         } else {
             format!(
                 "{APP_NAME} - {}/{} dimmed",
@@ -395,56 +537,25 @@ impl AppState {
         self.tray_icon.set_tooltip(&text);
     }
 
-    fn show_context_menu(&mut self) {
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-
-            let toggle_label = if self.monitor_manager.all_controllable_monitors_dimmed() {
-                "Undimming"
-            } else {
-                "Dimming"
-            };
-            append_menu_string(menu, ID_TOGGLE_DIMMING, toggle_label);
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-
-            for (id, label) in [
-                (ID_BRIGHTNESS_0, "0%"),
-                (ID_BRIGHTNESS_10, "10%"),
-                (ID_BRIGHTNESS_25, "25%"),
-                (ID_BRIGHTNESS_50, "50%"),
-                (ID_BRIGHTNESS_75, "75%"),
-                (ID_BRIGHTNESS_100, "100%"),
-            ] {
-                append_menu_string(menu, id, label);
+    fn restore_tray_icon(&mut self) {
+        match self.tray_icon.add() {
+            Ok(()) => {
+                if self
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("Failed to restore tray icon:"))
+                {
+                    self.last_error = None;
+                }
             }
-
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            append_menu_string(menu, ID_REFRESH, "Refresh now");
-            append_menu_string(menu, ID_DIAGNOSTICS, "Diagnostics");
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            append_menu_string(menu, ID_EXIT, "Exit");
-
-            let mut point = POINT::default();
-            if GetCursorPos(&mut point).is_ok() {
-                let _ = SetForegroundWindow(self.hwnd);
-                let _ = TrackPopupMenu(
-                    menu,
-                    TPM_RIGHTBUTTON,
-                    point.x,
-                    point.y,
-                    Some(0),
-                    self.hwnd,
-                    None,
-                );
+            Err(error) => {
+                self.last_error = Some(format!("Failed to restore tray icon: {error}"));
             }
-
-            let _ = DestroyMenu(menu);
         }
+        self.update_tray_text();
     }
 
-    fn show_diagnostics(&self) {
+    fn build_diagnostics(&self) -> String {
         let mut text = String::new();
         text.push_str(&format!(
             "Dimmed displays: {}\r\n",
@@ -453,6 +564,10 @@ impl AppState {
         text.push_str(&format!(
             "Debounce: {} ms\r\n",
             self.settings.event_debounce_milliseconds
+        ));
+        text.push_str(&format!(
+            "Brightness retry: {} ms\r\n",
+            self.settings.brightness_retry_milliseconds
         ));
         text.push_str(&format!(
             "Window events: {}\r\n",
@@ -469,15 +584,67 @@ impl AppState {
             text.push_str(error);
         }
 
-        let text = wide_null(&text);
-        unsafe {
-            MessageBoxW(
-                Some(self.hwnd),
-                PCWSTR(text.as_ptr()),
-                w!("MMD Diagnostics"),
-                MB_OK | MB_ICONINFORMATION,
-            );
+        text
+    }
+}
+
+fn show_context_menu(hwnd: HWND, manual_dimming_enabled: bool) -> Option<usize> {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return None;
+        };
+
+        append_checkable_menu_string(menu, ID_TOGGLE_DIMMING, "Dimming", manual_dimming_enabled);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+
+        for (id, label) in [
+            (ID_BRIGHTNESS_0, "0%"),
+            (ID_BRIGHTNESS_10, "10%"),
+            (ID_BRIGHTNESS_25, "25%"),
+            (ID_BRIGHTNESS_50, "50%"),
+            (ID_BRIGHTNESS_75, "75%"),
+            (ID_BRIGHTNESS_100, "100%"),
+        ] {
+            append_menu_string(menu, id, label);
         }
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        append_menu_string(menu, ID_REFRESH, "Refresh now");
+        append_menu_string(menu, ID_DIAGNOSTICS, "Diagnostics");
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        append_menu_string(menu, ID_EXIT, "Exit");
+
+        let mut command_id = 0;
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_ok() {
+            let _ = SetForegroundWindow(hwnd);
+            command_id = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                point.x,
+                point.y,
+                Some(0),
+                hwnd,
+                None,
+            )
+            .0;
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        }
+
+        let _ = DestroyMenu(menu);
+        (command_id > 0).then_some(command_id as usize)
+    }
+}
+
+fn show_diagnostics(hwnd: HWND, text: &str) {
+    let text = wide_null(text);
+    unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(text.as_ptr()),
+            w!("MMD Diagnostics"),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
 }
 
@@ -490,12 +657,17 @@ impl Drop for AppState {
 struct TrayIcon {
     hwnd: HWND,
     icon: HICON,
+    owns_icon: bool,
 }
 
 impl TrayIcon {
     fn new(hwnd: HWND) -> windows::core::Result<Self> {
-        let icon = load_app_icon();
-        let mut tray_icon = Self { hwnd, icon };
+        let (icon, owns_icon) = load_app_icon();
+        let mut tray_icon = Self {
+            hwnd,
+            icon,
+            owns_icon,
+        };
         tray_icon.add()?;
         tray_icon.set_tooltip(APP_NAME);
         Ok(tray_icon)
@@ -509,7 +681,7 @@ impl TrayIcon {
         write_tip(&mut data, APP_NAME);
 
         unsafe {
-            if !Shell_NotifyIconW(NIM_ADD, &mut data).as_bool() {
+            if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
                 return Err(Error::from_thread());
             }
         }
@@ -523,7 +695,7 @@ impl TrayIcon {
         write_tip(&mut data, text);
 
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &mut data);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
 
@@ -539,10 +711,10 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        let mut data = self.data();
+        let data = self.data();
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &mut data);
-            if !self.icon.0.is_null() {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            if self.owns_icon && !self.icon.0.is_null() {
                 let _ = DestroyIcon(self.icon);
             }
         }
@@ -630,12 +802,12 @@ unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     event_type: u32,
     hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
+    id_object: i32,
+    id_child: i32,
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if event_type >= EVENT_OBJECT_CREATE && hwnd.0.is_null() {
+    if !is_relevant_window_event(event_type, !hwnd.0.is_null(), id_object, id_child) {
         return;
     }
 
@@ -659,9 +831,42 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
+fn is_relevant_window_event(
+    event_type: u32,
+    has_window: bool,
+    id_object: i32,
+    id_child: i32,
+) -> bool {
+    if matches!(
+        event_type,
+        EVENT_SYSTEM_FOREGROUND
+            | EVENT_SYSTEM_MINIMIZESTART
+            | EVENT_SYSTEM_MINIMIZEEND
+            | EVENT_SYSTEM_DESKTOPSWITCH
+    ) {
+        return true;
+    }
+
+    has_window
+        && id_object == OBJID_WINDOW.0
+        && id_child == CHILDID_SELF as i32
+        && matches!(
+            event_type,
+            EVENT_OBJECT_CREATE
+                | EVENT_OBJECT_DESTROY
+                | EVENT_OBJECT_SHOW
+                | EVENT_OBJECT_HIDE
+                | EVENT_OBJECT_LOCATIONCHANGE
+                | EVENT_OBJECT_CLOAKED
+                | EVENT_OBJECT_UNCLOAKED
+        )
+}
+
 struct MonitorManager {
     settings: AppSettings,
     displays: Vec<DisplayState>,
+    detached_snapshots: HashMap<String, DisplaySnapshot>,
+    manual_dimming_enabled: bool,
 }
 
 impl MonitorManager {
@@ -669,6 +874,8 @@ impl MonitorManager {
         let mut manager = Self {
             settings,
             displays: Vec::new(),
+            detached_snapshots: HashMap::new(),
+            manual_dimming_enabled: false,
         };
         manager.enumerate_displays();
         manager
@@ -677,7 +884,12 @@ impl MonitorManager {
     fn controllable_display_count(&self) -> usize {
         self.displays
             .iter()
-            .filter(|display| !display.targets.is_empty())
+            .filter(|display| {
+                display
+                    .targets
+                    .iter()
+                    .any(PhysicalMonitorTarget::can_attempt_operations)
+            })
             .count()
     }
 
@@ -688,19 +900,15 @@ impl MonitorManager {
             .count()
     }
 
-    fn all_controllable_monitors_dimmed(&self) -> bool {
-        let mut has_controllable_monitor = false;
+    fn pending_operation_count(&self) -> usize {
+        self.displays
+            .iter()
+            .filter(|display| display.pending_operation.is_some())
+            .count()
+    }
 
-        for display in &self.displays {
-            for target in &display.targets {
-                has_controllable_monitor = true;
-                if !target.is_dimmed {
-                    return false;
-                }
-            }
-        }
-
-        has_controllable_monitor
+    fn manual_dimming_enabled(&self) -> bool {
+        self.manual_dimming_enabled
     }
 
     fn update(&mut self, windows: &[TrackedWindow]) {
@@ -708,51 +916,78 @@ impl MonitorManager {
             let (has_window, blocking_window) =
                 try_find_blocking_window(&self.settings, display, windows);
             display.last_blocking_window = blocking_window;
-            update_display_state(&self.settings, display, has_window);
+            update_display_state(
+                &self.settings,
+                display,
+                has_window,
+                self.manual_dimming_enabled,
+            );
         }
+    }
+
+    fn reenumerate(&mut self, windows: &[TrackedWindow]) {
+        self.detached_snapshots
+            .extend(capture_display_snapshots(&self.displays));
+        self.displays.clear();
+        self.enumerate_displays();
+        restore_display_snapshots(&mut self.displays, &mut self.detached_snapshots);
+        self.update(windows);
     }
 
     fn restore_all(&mut self) {
         for display in &mut self.displays {
-            restore(display, DisplayDimmingState::Lit);
+            display.pending_operation = None;
+            let mut restored = true;
+            for target in &mut display.targets {
+                restored &= target.restore_for_shutdown();
+            }
+            if restored {
+                display.dimming_state = DisplayDimmingState::Lit;
+            }
         }
     }
 
     fn restore_all_from_user(&mut self, windows: &[TrackedWindow]) {
+        self.manual_dimming_enabled = false;
         for display in &mut self.displays {
             let (has_window, blocking_window) =
                 try_find_blocking_window(&self.settings, display, windows);
             display.last_blocking_window = blocking_window;
-            restore(
+            request_operation(
                 display,
-                if has_window {
-                    DisplayDimmingState::Lit
-                } else {
-                    DisplayDimmingState::UserRestoredWhileEmpty
+                PendingBrightnessOperation::Restore {
+                    next_state: occupancy_state(has_window),
                 },
             );
         }
     }
 
     fn dim_all(&mut self) {
+        self.manual_dimming_enabled = true;
         for display in &mut self.displays {
-            dim(&self.settings, display, DisplayDimmingState::UserDimmed);
+            request_operation(
+                display,
+                PendingBrightnessOperation::Dim {
+                    brightness: self.settings.empty_brightness,
+                    next_state: DisplayDimmingState::UserDimmed,
+                },
+            );
             display.last_blocking_window = Some("Tray icon click".to_string());
         }
     }
 
     fn set_all_brightness(&mut self, brightness: u32, windows: &[TrackedWindow]) {
+        self.manual_dimming_enabled = false;
         for display in &mut self.displays {
             let (has_window, blocking_window) =
                 try_find_blocking_window(&self.settings, display, windows);
-            for target in &mut display.targets {
-                target.set_brightness(brightness);
-            }
-            display.dimming_state = if has_window {
-                DisplayDimmingState::Lit
-            } else {
-                DisplayDimmingState::UserRestoredWhileEmpty
-            };
+            request_operation(
+                display,
+                PendingBrightnessOperation::Set {
+                    brightness,
+                    next_state: occupancy_state(has_window),
+                },
+            );
             display.last_blocking_window =
                 blocking_window.or_else(|| Some(format!("Brightness set to {brightness}%")));
         }
@@ -761,12 +996,17 @@ impl MonitorManager {
     fn build_diagnostic_text(&self) -> String {
         let mut lines = vec![
             "DPI mode: PerMonitorV2".to_string(),
+            format!("Manual dimming: {}", self.manual_dimming_enabled),
             format!(
                 "Controllable displays: {}/{}",
                 self.controllable_display_count(),
                 self.displays.len()
             ),
             format!("Dimmed displays: {}", self.dimmed_display_count()),
+            format!(
+                "Detached display snapshots: {}",
+                self.detached_snapshots.len()
+            ),
             String::new(),
         ];
 
@@ -779,14 +1019,15 @@ impl MonitorManager {
                 display.targets.len()
             ));
             lines.push(format!("  State: {:?}", display.dimming_state));
+            lines.push(format!("  Pending: {:?}", display.pending_operation));
             lines.push(format!(
                 "  Blocking window: {}",
                 display.last_blocking_window.as_deref().unwrap_or("(none)")
             ));
             for target in &display.targets {
                 lines.push(format!(
-                    "  Monitor: {} dimmed={}",
-                    target.description, target.is_dimmed
+                    "  Monitor: {} dimmed={} availability={:?}",
+                    target.description, target.is_dimmed, target.availability
                 ));
             }
         }
@@ -801,6 +1042,7 @@ impl MonitorManager {
                 bounds: display_info.bounds,
                 targets: Vec::new(),
                 dimming_state: DisplayDimmingState::Lit,
+                pending_operation: None,
                 last_blocking_window: None,
             };
 
@@ -826,15 +1068,20 @@ impl MonitorManager {
                     continue;
                 }
 
-                for physical_monitor in physical_monitors {
+                for (physical_index, physical_monitor) in physical_monitors.into_iter().enumerate()
+                {
                     let handle = addr_of!(physical_monitor.hPhysicalMonitor).read_unaligned();
                     let description =
                         addr_of!(physical_monitor.szPhysicalMonitorDescription).read_unaligned();
-                    let target =
-                        PhysicalMonitorTarget::new(handle, string_from_wide_slice(&description));
-                    if target.try_read_brightness().is_some() {
-                        display.targets.push(target);
-                    }
+                    let description = string_from_wide_slice(&description);
+                    let key = TargetKey {
+                        display_device_name: display.device_name.clone(),
+                        description: normalize_name(&description),
+                        physical_index,
+                    };
+                    display
+                        .targets
+                        .push(PhysicalMonitorTarget::new(handle, key, description));
                 }
             }
 
@@ -862,82 +1109,303 @@ struct DisplayState {
     bounds: SimpleRect,
     targets: Vec<PhysicalMonitorTarget>,
     dimming_state: DisplayDimmingState,
+    pending_operation: Option<PendingBrightnessOperation>,
     last_blocking_window: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TargetKey {
+    display_device_name: String,
+    description: String,
+    physical_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetAvailability {
+    Unknown,
+    Available,
+    TemporarilyUnavailable,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetSnapshot {
+    restore_brightness: Option<u32>,
+    is_dimmed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DisplaySnapshot {
+    dimming_state: DisplayDimmingState,
+    pending_operation: Option<PendingBrightnessOperation>,
+    targets: HashMap<TargetKey, TargetSnapshot>,
+}
+
+fn capture_display_snapshots(displays: &[DisplayState]) -> HashMap<String, DisplaySnapshot> {
+    displays
+        .iter()
+        .map(|display| {
+            let targets = display
+                .targets
+                .iter()
+                .map(|target| {
+                    (
+                        target.key.clone(),
+                        TargetSnapshot {
+                            restore_brightness: target.restore_brightness,
+                            is_dimmed: target.is_dimmed,
+                        },
+                    )
+                })
+                .collect();
+            (
+                display.device_name.clone(),
+                DisplaySnapshot {
+                    dimming_state: display.dimming_state,
+                    pending_operation: display.pending_operation,
+                    targets,
+                },
+            )
+        })
+        .collect()
+}
+
+fn restore_display_snapshots(
+    displays: &mut [DisplayState],
+    snapshots: &mut HashMap<String, DisplaySnapshot>,
+) {
+    for display in displays {
+        let Some(snapshot) = snapshots.remove(&display.device_name) else {
+            continue;
+        };
+
+        let force_dim_reapplication = snapshot.pending_operation.is_none()
+            && matches!(
+                snapshot.dimming_state,
+                DisplayDimmingState::AutoDimmed | DisplayDimmingState::UserDimmed
+            );
+        let mut matched_target = false;
+
+        for target in &mut display.targets {
+            let Some(target_snapshot) = snapshot.targets.get(&target.key) else {
+                continue;
+            };
+
+            matched_target = true;
+            target.restore_brightness = target_snapshot.restore_brightness;
+            target.is_dimmed = if force_dim_reapplication {
+                false
+            } else {
+                target_snapshot.is_dimmed
+            };
+        }
+
+        if matched_target || snapshot.targets.is_empty() {
+            display.dimming_state = snapshot.dimming_state;
+            display.pending_operation = snapshot.pending_operation;
+        } else {
+            snapshots.insert(display.device_name.clone(), snapshot);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingBrightnessOperation {
+    Dim {
+        brightness: u32,
+        next_state: DisplayDimmingState,
+    },
+    Restore {
+        next_state: DisplayDimmingState,
+    },
+    Set {
+        brightness: u32,
+        next_state: DisplayDimmingState,
+    },
+}
+
+impl PendingBrightnessOperation {
+    fn next_state(self) -> DisplayDimmingState {
+        match self {
+            Self::Dim { next_state, .. }
+            | Self::Restore { next_state }
+            | Self::Set { next_state, .. } => next_state,
+        }
+    }
 }
 
 struct PhysicalMonitorTarget {
     handle: HANDLE,
+    key: TargetKey,
     description: String,
-    restore_brightness: u32,
+    restore_brightness: Option<u32>,
     is_dimmed: bool,
+    availability: TargetAvailability,
+    consecutive_failures: u8,
     disposed: bool,
 }
 
 impl PhysicalMonitorTarget {
-    fn new(
-        handle: HANDLE,
-        description: String,
-    ) -> Self {
-        Self {
+    fn new(handle: HANDLE, key: TargetKey, description: String) -> Self {
+        let mut target = Self {
             handle,
+            key,
             description: if description.trim().is_empty() {
                 "Unknown monitor".to_string()
             } else {
                 description
             },
-            restore_brightness: 0,
+            restore_brightness: None,
             is_dimmed: false,
+            availability: TargetAvailability::Unknown,
+            consecutive_failures: 0,
             disposed: false,
+        };
+        target.probe_availability();
+        target
+    }
+
+    fn probe_availability(&mut self) {
+        if self.disposed {
+            return;
+        }
+
+        let mut capabilities = 0;
+        let mut color_temperatures = 0;
+        let capabilities_available = unsafe {
+            GetMonitorCapabilities(self.handle, &mut capabilities, &mut color_temperatures) != 0
+        };
+
+        if capabilities_available && capabilities & MC_CAPS_BRIGHTNESS == 0 {
+            self.availability = TargetAvailability::Unsupported;
+            return;
+        }
+
+        if self.try_read_brightness_full().is_some() {
+            self.record_success();
+        } else {
+            let _ = self.record_failure();
         }
     }
 
-    fn dim(&mut self, empty_brightness: u32) {
+    fn can_attempt_operations(&self) -> bool {
+        !self.disposed
+            && matches!(
+                self.availability,
+                TargetAvailability::Unknown
+                    | TargetAvailability::Available
+                    | TargetAvailability::TemporarilyUnavailable
+            )
+    }
+
+    fn record_success(&mut self) {
+        self.availability = TargetAvailability::Available;
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= MAX_TARGET_FAILURES {
+            self.availability = TargetAvailability::Unavailable;
+            true
+        } else {
+            self.availability = TargetAvailability::TemporarilyUnavailable;
+            false
+        }
+    }
+
+    fn dim(&mut self, empty_brightness_percent: u32) -> bool {
         if self.disposed {
-            return;
+            return false;
+        }
+        if !self.can_attempt_operations() {
+            return true;
         }
 
         let Some((minimum, current, maximum)) = self.try_read_brightness_full() else {
-            return;
+            return self.record_failure();
         };
 
-        if !self.is_dimmed {
-            self.restore_brightness = current;
+        if !self.is_dimmed && self.restore_brightness.is_none() {
+            self.restore_brightness = Some(current);
         }
 
-        let brightness = empty_brightness.clamp(minimum, maximum);
+        let brightness = percent_to_raw(minimum, maximum, empty_brightness_percent);
         if self.try_set_brightness(brightness) {
+            self.record_success();
             self.is_dimmed = true;
+            true
+        } else {
+            self.record_failure()
         }
     }
 
-    fn set_brightness(&mut self, brightness: u32) {
+    fn set_brightness(&mut self, brightness_percent: u32) -> bool {
         if self.disposed {
-            return;
+            return false;
+        }
+        if !self.can_attempt_operations() {
+            return true;
         }
 
         let Some((minimum, _, maximum)) = self.try_read_brightness_full() else {
-            return;
+            return self.record_failure();
         };
 
-        let brightness = brightness.clamp(minimum, maximum);
+        let brightness = percent_to_raw(minimum, maximum, brightness_percent);
         if self.try_set_brightness(brightness) {
-            self.restore_brightness = brightness;
+            self.record_success();
+            self.restore_brightness = Some(brightness);
             self.is_dimmed = false;
+            true
+        } else {
+            self.record_failure()
         }
     }
 
-    fn restore(&mut self) {
-        if !self.is_dimmed || self.disposed {
-            return;
+    fn restore(&mut self) -> bool {
+        if self.disposed {
+            return false;
+        }
+        if !self.is_dimmed {
+            return true;
+        }
+        if !self.can_attempt_operations() {
+            return true;
         }
 
-        if self.try_set_brightness(self.restore_brightness) {
+        let Some(restore_brightness) = self.restore_brightness else {
             self.is_dimmed = false;
+            return true;
+        };
+
+        if self.try_set_brightness(restore_brightness) {
+            self.record_success();
+            self.is_dimmed = false;
+            true
+        } else {
+            self.record_failure()
         }
     }
 
-    fn try_read_brightness(&self) -> Option<u32> {
-        self.try_read_brightness_full().map(|(_, current, _)| current)
+    fn restore_for_shutdown(&mut self) -> bool {
+        if self.disposed {
+            return false;
+        }
+        if !self.is_dimmed {
+            return true;
+        }
+
+        let Some(restore_brightness) = self.restore_brightness else {
+            return false;
+        };
+        if self.try_set_brightness(restore_brightness) {
+            self.is_dimmed = false;
+            true
+        } else {
+            false
+        }
     }
 
     fn try_read_brightness_full(&self) -> Option<(u32, u32, u32)> {
@@ -1033,9 +1501,6 @@ fn try_get_tracked_window(
         }
 
         let title_length = GetWindowTextLengthW(hwnd);
-        if title_length <= 0 {
-            return None;
-        }
 
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         if !settings.include_tool_windows && (ex_style & WS_EX_TOOLWINDOW) == WS_EX_TOOLWINDOW {
@@ -1063,10 +1528,11 @@ fn try_get_tracked_window(
             return None;
         }
 
-        let title = get_window_text(hwnd, title_length + 1);
-        if title.trim().is_empty() {
-            return None;
-        }
+        let title = if title_length > 0 {
+            window_title_or_placeholder(get_window_text(hwnd, title_length + 1))
+        } else {
+            window_title_or_placeholder(String::new())
+        };
 
         let class_name = get_class_name(hwnd);
         if settings
@@ -1165,17 +1631,77 @@ fn update_display_state(
     settings: &AppSettings,
     display: &mut DisplayState,
     has_window: bool,
+    manual_dimming_enabled: bool,
 ) {
     if display.targets.is_empty() {
         display.dimming_state = DisplayDimmingState::Lit;
+        display.pending_operation = None;
         return;
+    }
+
+    if manual_dimming_enabled {
+        if display.pending_operation.is_some() {
+            display.pending_operation = Some(PendingBrightnessOperation::Dim {
+                brightness: settings.empty_brightness,
+                next_state: DisplayDimmingState::UserDimmed,
+            });
+            if !apply_pending_operation(display) {
+                return;
+            }
+        }
+
+        if display
+            .targets
+            .iter()
+            .any(|target| target.can_attempt_operations() && !target.is_dimmed)
+        {
+            request_operation(
+                display,
+                PendingBrightnessOperation::Dim {
+                    brightness: settings.empty_brightness,
+                    next_state: DisplayDimmingState::UserDimmed,
+                },
+            );
+        } else {
+            display.dimming_state = DisplayDimmingState::UserDimmed;
+        }
+        return;
+    }
+
+    if let Some(operation) = display.pending_operation {
+        display.pending_operation = Some(reconcile_pending_operation(
+            operation,
+            has_window,
+            settings.empty_brightness,
+        ));
+        if !apply_pending_operation(display) {
+            return;
+        }
     }
 
     if has_window {
         match display.dimming_state {
-            DisplayDimmingState::AutoDimmed => restore(display, DisplayDimmingState::Lit),
+            DisplayDimmingState::AutoDimmed => request_operation(
+                display,
+                PendingBrightnessOperation::Restore {
+                    next_state: DisplayDimmingState::Lit,
+                },
+            ),
             DisplayDimmingState::UserRestoredWhileEmpty => {
                 display.dimming_state = DisplayDimmingState::Lit;
+            }
+            DisplayDimmingState::Lit
+                if display
+                    .targets
+                    .iter()
+                    .any(|target| target.can_attempt_operations() && target.is_dimmed) =>
+            {
+                request_operation(
+                    display,
+                    PendingBrightnessOperation::Restore {
+                        next_state: DisplayDimmingState::Lit,
+                    },
+                );
             }
             _ => {}
         }
@@ -1183,46 +1709,128 @@ fn update_display_state(
     }
 
     match display.dimming_state {
-        DisplayDimmingState::Lit => dim(settings, display, DisplayDimmingState::AutoDimmed),
+        DisplayDimmingState::Lit => request_operation(
+            display,
+            PendingBrightnessOperation::Dim {
+                brightness: settings.empty_brightness,
+                next_state: DisplayDimmingState::AutoDimmed,
+            },
+        ),
         DisplayDimmingState::UserDimmed => {
             display.dimming_state = DisplayDimmingState::AutoDimmed;
         }
         DisplayDimmingState::AutoDimmed => {
-            if display.targets.iter().any(|target| !target.is_dimmed) {
-                dim(settings, display, display.dimming_state);
+            if display
+                .targets
+                .iter()
+                .any(|target| target.can_attempt_operations() && !target.is_dimmed)
+            {
+                request_operation(
+                    display,
+                    PendingBrightnessOperation::Dim {
+                        brightness: settings.empty_brightness,
+                        next_state: display.dimming_state,
+                    },
+                );
             }
         }
-        DisplayDimmingState::UserRestoredWhileEmpty => {}
+        DisplayDimmingState::UserRestoredWhileEmpty => {
+            if display
+                .targets
+                .iter()
+                .any(|target| target.can_attempt_operations() && target.is_dimmed)
+            {
+                request_operation(
+                    display,
+                    PendingBrightnessOperation::Restore {
+                        next_state: DisplayDimmingState::UserRestoredWhileEmpty,
+                    },
+                );
+            }
+        }
     }
 }
 
-fn dim(settings: &AppSettings, display: &mut DisplayState, state: DisplayDimmingState) {
-    if display.targets.is_empty() {
-        display.dimming_state = DisplayDimmingState::Lit;
-        return;
+fn occupancy_state(has_window: bool) -> DisplayDimmingState {
+    if has_window {
+        DisplayDimmingState::Lit
+    } else {
+        DisplayDimmingState::UserRestoredWhileEmpty
     }
-
-    for target in &mut display.targets {
-        target.dim(settings.empty_brightness);
-    }
-    display.dimming_state = state;
 }
 
-fn restore(display: &mut DisplayState, state: DisplayDimmingState) {
+fn percent_to_raw(minimum: u32, maximum: u32, percent: u32) -> u32 {
+    if maximum <= minimum {
+        return minimum;
+    }
+
+    let range = u64::from(maximum - minimum);
+    let scaled = (range * u64::from(percent.min(100)) + 50) / 100;
+    minimum + scaled as u32
+}
+
+fn reconcile_pending_operation(
+    operation: PendingBrightnessOperation,
+    has_window: bool,
+    empty_brightness: u32,
+) -> PendingBrightnessOperation {
+    match operation {
+        PendingBrightnessOperation::Dim {
+            next_state: DisplayDimmingState::AutoDimmed,
+            ..
+        } if has_window => PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        },
+        PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        } if !has_window => PendingBrightnessOperation::Dim {
+            brightness: empty_brightness,
+            next_state: DisplayDimmingState::AutoDimmed,
+        },
+        PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::UserRestoredWhileEmpty,
+        } if has_window => PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        },
+        PendingBrightnessOperation::Set { brightness, .. } => PendingBrightnessOperation::Set {
+            brightness,
+            next_state: occupancy_state(has_window),
+        },
+        operation => operation,
+    }
+}
+
+fn request_operation(display: &mut DisplayState, operation: PendingBrightnessOperation) {
     if display.targets.is_empty() {
         display.dimming_state = DisplayDimmingState::Lit;
+        display.pending_operation = None;
         return;
     }
 
-    if display.targets.iter().all(|target| !target.is_dimmed) {
-        display.dimming_state = state;
-        return;
-    }
+    display.pending_operation = Some(operation);
+    let _ = apply_pending_operation(display);
+}
 
+fn apply_pending_operation(display: &mut DisplayState) -> bool {
+    let Some(operation) = display.pending_operation else {
+        return true;
+    };
+
+    let mut succeeded = true;
     for target in &mut display.targets {
-        target.restore();
+        succeeded &= match operation {
+            PendingBrightnessOperation::Dim { brightness, .. } => target.dim(brightness),
+            PendingBrightnessOperation::Restore { .. } => target.restore(),
+            PendingBrightnessOperation::Set { brightness, .. } => target.set_brightness(brightness),
+        };
     }
-    display.dimming_state = state;
+
+    if succeeded {
+        display.dimming_state = operation.next_state();
+        display.pending_operation = None;
+    }
+
+    succeeded
 }
 
 unsafe extern "system" fn enum_display_monitor_proc(
@@ -1270,6 +1878,14 @@ fn get_window_text(hwnd: HWND, capacity: i32) -> String {
     }
 }
 
+fn window_title_or_placeholder(title: String) -> String {
+    if title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        title
+    }
+}
+
 fn get_class_name(hwnd: HWND) -> String {
     let mut buffer = vec![0u16; 256];
     unsafe {
@@ -1291,8 +1907,12 @@ fn get_process_name(process_id: u32) -> String {
 
         let mut buffer = vec![0u16; 32768];
         let mut size = buffer.len() as u32;
-        let ok =
-            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size);
+        let ok = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        );
         let _ = CloseHandle(process);
 
         if ok.is_err() || size == 0 {
@@ -1315,28 +1935,39 @@ fn append_menu_string(menu: HMENU, id: usize, text: &str) {
     }
 }
 
-fn load_app_icon() -> HICON {
+fn append_checkable_menu_string(menu: HMENU, id: usize, text: &str, checked: bool) {
+    let text = wide_null(text);
+    let checked_flag = if checked { MF_CHECKED } else { MF_UNCHECKED };
     unsafe {
-        if let Ok(module) = GetModuleHandleW(None) {
-            if let Ok(handle) = LoadImageW(
+        let _ = AppendMenuW(menu, MF_STRING | checked_flag, id, PCWSTR(text.as_ptr()));
+    }
+}
+
+fn load_app_icon() -> (HICON, bool) {
+    unsafe {
+        if let Ok(module) = GetModuleHandleW(None)
+            && let Ok(handle) = LoadImageW(
                 Some(HINSTANCE(module.0)),
                 APP_ICON_RESOURCE_ID,
                 IMAGE_ICON,
                 0,
                 0,
                 LR_DEFAULTSIZE,
-            ) {
-                return HICON(handle.0);
-            }
+            )
+        {
+            return (HICON(handle.0), true);
         }
 
-        LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+        (LoadIconW(None, IDI_APPLICATION).unwrap_or_default(), false)
     }
 }
 
 fn write_tip(data: &mut NOTIFYICONDATAW, text: &str) {
     data.szTip.fill(0);
-    let mut wide = text.encode_utf16().take(data.szTip.len() - 1).collect::<Vec<_>>();
+    let mut wide = text
+        .encode_utf16()
+        .take(data.szTip.len() - 1)
+        .collect::<Vec<_>>();
     if wide.len() == data.szTip.len() - 1 && text.encode_utf16().count() > wide.len() {
         wide.truncate(data.szTip.len() - 4);
         wide.extend("...".encode_utf16());
@@ -1352,7 +1983,10 @@ fn wide_null(text: &str) -> Vec<u16> {
 }
 
 fn string_from_wide_slice(buffer: &[u16]) -> String {
-    let len = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+    let len = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
 }
 
@@ -1379,7 +2013,287 @@ fn get_event_name(event_type: u32) -> String {
 
 fn format_system_time(time: SystemTime) -> String {
     match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => format!("unix+{}.{:03}s", duration.as_secs(), duration.subsec_millis()),
+        Ok(duration) => format!(
+            "unix+{}.{:03}s",
+            duration.as_secs(),
+            duration.subsec_millis()
+        ),
         Err(_) => "(unknown time)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_target(
+        display_device_name: &str,
+        description: &str,
+        physical_index: usize,
+        restore_brightness: Option<u32>,
+        is_dimmed: bool,
+    ) -> PhysicalMonitorTarget {
+        PhysicalMonitorTarget {
+            handle: HANDLE::default(),
+            key: TargetKey {
+                display_device_name: display_device_name.to_string(),
+                description: normalize_name(description),
+                physical_index,
+            },
+            description: description.to_string(),
+            restore_brightness,
+            is_dimmed,
+            availability: TargetAvailability::Available,
+            consecutive_failures: 0,
+            disposed: true,
+        }
+    }
+
+    fn test_display(
+        device_name: &str,
+        targets: Vec<PhysicalMonitorTarget>,
+        dimming_state: DisplayDimmingState,
+        pending_operation: Option<PendingBrightnessOperation>,
+    ) -> DisplayState {
+        DisplayState {
+            device_name: device_name.to_string(),
+            bounds: SimpleRect {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+            targets,
+            dimming_state,
+            pending_operation,
+            last_blocking_window: None,
+        }
+    }
+
+    #[test]
+    fn rectangle_intersection_uses_physical_overlap() {
+        let display = SimpleRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let window = SimpleRect {
+            left: 1900,
+            top: 100,
+            right: 2100,
+            bottom: 300,
+        };
+
+        let intersection = display.intersect(window);
+        assert_eq!(intersection.width(), 20);
+        assert_eq!(intersection.height(), 200);
+    }
+
+    #[test]
+    fn pending_auto_dim_turns_into_restore_when_a_window_arrives() {
+        let operation = PendingBrightnessOperation::Dim {
+            brightness: 0,
+            next_state: DisplayDimmingState::AutoDimmed,
+        };
+
+        assert_eq!(
+            reconcile_pending_operation(operation, true, 0),
+            PendingBrightnessOperation::Restore {
+                next_state: DisplayDimmingState::Lit,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_auto_restore_turns_back_into_dim_when_window_leaves() {
+        let operation = PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        };
+
+        assert_eq!(
+            reconcile_pending_operation(operation, false, 10),
+            PendingBrightnessOperation::Dim {
+                brightness: 10,
+                next_state: DisplayDimmingState::AutoDimmed,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_manual_brightness_tracks_current_occupancy() {
+        let operation = PendingBrightnessOperation::Set {
+            brightness: 50,
+            next_state: DisplayDimmingState::UserRestoredWhileEmpty,
+        };
+
+        assert_eq!(
+            reconcile_pending_operation(operation, true, 0),
+            PendingBrightnessOperation::Set {
+                brightness: 50,
+                next_state: DisplayDimmingState::Lit,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_brightness_operation_remains_pending() {
+        let operation = PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        };
+        let mut display = test_display(
+            "test",
+            vec![test_target("test", "test", 0, Some(50), true)],
+            DisplayDimmingState::AutoDimmed,
+            Some(operation),
+        );
+
+        assert!(!apply_pending_operation(&mut display));
+        assert_eq!(display.dimming_state, DisplayDimmingState::AutoDimmed);
+        assert_eq!(display.pending_operation, Some(operation));
+    }
+
+    #[test]
+    fn accessibility_child_events_are_ignored() {
+        assert!(is_relevant_window_event(
+            EVENT_OBJECT_SHOW,
+            true,
+            OBJID_WINDOW.0,
+            CHILDID_SELF as i32,
+        ));
+        assert!(!is_relevant_window_event(
+            EVENT_OBJECT_SHOW,
+            true,
+            OBJID_WINDOW.0,
+            1,
+        ));
+        assert!(!is_relevant_window_event(
+            EVENT_OBJECT_SHOW,
+            true,
+            OBJID_WINDOW.0 + 1,
+            CHILDID_SELF as i32,
+        ));
+    }
+
+    #[test]
+    fn system_events_do_not_require_a_window_handle() {
+        assert!(is_relevant_window_event(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            false,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn brightness_percent_is_scaled_to_the_monitor_range() {
+        assert_eq!(percent_to_raw(20, 220, 0), 20);
+        assert_eq!(percent_to_raw(20, 220, 25), 70);
+        assert_eq!(percent_to_raw(20, 220, 50), 120);
+        assert_eq!(percent_to_raw(20, 220, 100), 220);
+        assert_eq!(percent_to_raw(20, 220, 150), 220);
+        assert_eq!(percent_to_raw(80, 80, 50), 80);
+    }
+
+    #[test]
+    fn failed_target_is_only_disabled_after_repeated_failures() {
+        let mut target = test_target("display", "monitor", 0, None, false);
+        target.availability = TargetAvailability::Unknown;
+
+        assert!(!target.record_failure());
+        assert_eq!(
+            target.availability,
+            TargetAvailability::TemporarilyUnavailable
+        );
+        assert!(!target.record_failure());
+        assert!(target.record_failure());
+        assert_eq!(target.availability, TargetAvailability::Unavailable);
+    }
+
+    #[test]
+    fn reenumeration_preserves_restore_brightness_and_manual_state() {
+        let old_display = test_display(
+            "display",
+            vec![test_target("display", "monitor", 0, Some(73), true)],
+            DisplayDimmingState::UserDimmed,
+            None,
+        );
+        let mut snapshots = capture_display_snapshots(&[old_display]);
+        let mut new_displays = vec![test_display(
+            "display",
+            vec![test_target("display", "monitor", 0, None, false)],
+            DisplayDimmingState::Lit,
+            None,
+        )];
+
+        restore_display_snapshots(&mut new_displays, &mut snapshots);
+
+        assert!(snapshots.is_empty());
+        assert_eq!(
+            new_displays[0].dimming_state,
+            DisplayDimmingState::UserDimmed
+        );
+        assert_eq!(new_displays[0].targets[0].restore_brightness, Some(73));
+        assert!(!new_displays[0].targets[0].is_dimmed);
+    }
+
+    #[test]
+    fn reenumeration_preserves_pending_operation() {
+        let operation = PendingBrightnessOperation::Restore {
+            next_state: DisplayDimmingState::Lit,
+        };
+        let old_display = test_display(
+            "display",
+            vec![test_target("display", "monitor", 0, Some(73), true)],
+            DisplayDimmingState::AutoDimmed,
+            Some(operation),
+        );
+        let mut snapshots = capture_display_snapshots(&[old_display]);
+        let mut new_displays = vec![test_display(
+            "display",
+            vec![test_target("display", "monitor", 0, None, false)],
+            DisplayDimmingState::Lit,
+            None,
+        )];
+
+        restore_display_snapshots(&mut new_displays, &mut snapshots);
+
+        assert_eq!(new_displays[0].pending_operation, Some(operation));
+        assert!(new_displays[0].targets[0].is_dimmed);
+    }
+
+    #[test]
+    fn manual_dimming_check_state_tracks_user_intent_even_when_ddc_fails() {
+        let mut manager = MonitorManager {
+            settings: AppSettings::default(),
+            displays: vec![test_display(
+                "display",
+                vec![test_target("display", "monitor", 0, Some(73), false)],
+                DisplayDimmingState::Lit,
+                None,
+            )],
+            detached_snapshots: HashMap::new(),
+            manual_dimming_enabled: false,
+        };
+
+        manager.dim_all();
+
+        assert!(manager.manual_dimming_enabled());
+        assert!(manager.displays[0].pending_operation.is_some());
+        assert!(!manager.displays[0].targets[0].is_dimmed);
+
+        manager.restore_all_from_user(&[]);
+
+        assert!(!manager.manual_dimming_enabled());
+    }
+
+    #[test]
+    fn empty_window_title_uses_a_diagnostic_placeholder() {
+        assert_eq!(window_title_or_placeholder(String::new()), "(untitled)");
+        assert_eq!(window_title_or_placeholder("   ".to_string()), "(untitled)");
+        assert_eq!(
+            window_title_or_placeholder("Settings".to_string()),
+            "Settings"
+        );
     }
 }
